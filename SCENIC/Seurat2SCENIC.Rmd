@@ -1,0 +1,459 @@
+---
+title: "Running SCENIC"
+subtitle: SCENIC (Single Cell rEgulatory Network Inference and Clustering)
+output:
+  html_notebook:
+    toc: yes
+  BiocStyle::html_document:
+    number_sections: no
+    toc: yes
+    toc_float: false
+    css: corrected.css
+  pdf_document:
+    toc: yes
+---
+
+# Load packages
+```{r options, echo=FALSE, results="hide",mesasge=FALSE, error=FALSE, include=FALSE, autodep=TRUE}
+# Suppress loading messages when building the HTML
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(URD)
+  library(SCENIC)
+  library(AUCell)
+  library(RcisTarget)
+  library(SingleCellExperiment)
+  library(doParallel)
+})
+```
+
+# Create folders to organize output
+```{r create_folders}
+# create directiories to organize the results
+dir.create("int");dir.create("output");dir.create("figures")
+```
+
+# Generate input files for SCENIC analysis
+## Load Seurat object and export
+```{r load_data}
+cdS <- readRDS(file = "../Seurat/data/Diencephalon_merged.rds")
+# cdS <- UpdateSeuratObject(cdS) # for Seurat object created before version 2.0
+```
+
+## Remove non-neural cells
+```{r filter_cell_groups, fig.asp=1:1}
+TSNEPlot(object = cdS, do.label = TRUE, pt.size = 0.5, no.legend = TRUE)
+
+ident.remove <- c(16,19,20) # change the ident
+cdS <- SubsetData(cdS, ident.remove = ident.remove, subset.raw =T)
+```
+
+## Print tSNE to varify the selected cell groups
+```{r tSNE_plot, fig.asp=1:1}
+TSNEPlot(object = cdS, do.label = TRUE, pt.size = 0.5,no.legend = TRUE)
+```
+
+## Export count matrix and cluster information
+```{r Seurat2SCENIC}
+# export count matrix
+exprMat <- as.matrix(cdS@raw.data)
+dim(exprMat)
+
+# Assign colors to cell groups
+cellInfo <- as.data.frame(cdS@ident)
+colnames(cellInfo) <- "level1class"
+
+colVars <- list(level1class=setNames(rainbow(length(levels(cdS@ident))), levels(cdS@ident)))
+plot.new(); legend(0,1, fill=colVars$level1class, legend=names(colVars$level1class))
+```
+
+## Save the objects for SCENIC analysis
+```{r save_object}
+save(colVars,cellInfo,exprMat,file="./int/forSCENIC.RData")
+```
+
+# Initialize SCENIC settings
+## Load TF motif database
+```{r select_organism}
+library(RcisTarget.mm9.motifDatabases.20k)
+
+# Get genes in databases:
+data(mm9_500bpUpstream_motifRanking) # or 10kbp, they should have the same genes
+genesInDatabase <- mm9_500bpUpstream_motifRanking@rankings$rn
+
+# Get TFS in databases:
+data(mm9_direct_motifAnnotation)
+allTFs <- mm9_direct_motifAnnotation$allTFs
+```
+
+## Gene filter/selection
+Apply a filtering based on the total count of the gene, and the number of cells in which it is detected.
+```{r generate_stat}
+nCellsPerGene <- apply(exprMat, 1, function(x) sum(x>0))
+nCountsPerGene <- apply(exprMat, 1, sum)
+
+print("number of cells per gene"); summary(nCellsPerGene)
+print("number of counts per gene"); summary(nCountsPerGene)
+max(exprMat)
+sum(exprMat>0)/sum(exprMat==0)
+```
+
+### First filter
+Keep only the genes with at least 90.15 UMI counts across all samples (e.g. the total number the gene would have, if it was expressed with a value of 3 in 1% of the cells). Adjust this value according to the dataset (it will depend on the dataset units, e.g. UMI, TPMs…)
+```{r 1st_filter}
+minReads <- 3*.01*ncol(exprMat)
+genesLeft_minReads <- names(nCountsPerGene)[which(nCountsPerGene > minReads)]
+length(genesLeft_minReads)
+```
+
+### Second filter
+Keep only the genes that are detected in at least minimal percentage of the cells (the smallest population of detected cells). This filtering is meant to remove genes whose reads come from one a few ‘noisy’ cells. 
+```{r 2nd_filter}
+prop <- min(table(cdS@ident)/ncol(cdS@raw.data))
+minSamples <- ncol(exprMat)*prop
+nCellsPerGene2 <- nCellsPerGene[genesLeft_minReads]
+genesLeft_minCells <- names(nCellsPerGene2)[which(nCellsPerGene2 > minSamples)]
+length(genesLeft_minCells)
+
+genesLeft_minCells_inDatabases <- genesLeft_minCells[which(genesLeft_minCells %in% genesInDatabase)]
+length(genesLeft_minCells_inDatabases)
+
+exprMatrix_filtered <- exprMat[genesLeft_minCells_inDatabases, ]
+dim(exprMatrix_filtered)
+```
+
+## Save filtered gene matrix
+```{r save_filtered}
+save(exprMatrix_filtered, file="int/1.1_exprMatrix_filtered.RData")
+```
+
+## Check whether any relevant gene / potential gene of interest is missing:
+```{r}
+interestingGenes <- c("Lhx2", "Gbx2", "Tal1","Olig2","Dlx5","Ascl1","Ebf3")
+interestingGenes[which(!interestingGenes %in% rownames(exprMatrix_filtered))]
+
+rm(exprMat)
+```
+
+## Potential regulators: List of transcription factors
+```{r}
+inputTFs <- allTFs[allTFs%in% rownames(exprMatrix_filtered)]
+length(inputTFs)
+c(allTFs=length(allTFs), inputTFs=length(inputTFs))
+```
+
+```{r save_TFs}
+save(inputTFs, file="int/1.2_inputTFs.RData")
+```
+
+# Perform GENIE3 analysis
+This step is intensive in computation and it take a long time to run. It was run in HPC. Here we load the previous saved object.
+```{r GENIE3}
+set.seed(123)
+# weightMatrix <- GENIE3(exprMatrix = exprMatrix_filtered, treeMethod = "RF", K = "sqrt", nTrees = 1000,
+#                        regulators=inputTFs, targets = NULL, nCores = 24, verbose = TRUE)
+# save(weightMatrix, file="int/1.3_GENIE3_weightMatrix.RData")
+
+load("int/1.3_GENIE3_weightMatrix.RData")
+```
+
+# Generate correlation matrix
+```{r corrMat}
+# load("int/1.1_exprMatrix_filtered.RData")
+corrMat <- cor(t(exprMatrix_filtered), method="spearman")
+save(corrMat, file="int/1.4_corrMat.RData")
+```
+
+# Generate correlation pair list
+```{r}
+linkList <- getLinkList(weightMatrix)
+colnames(linkList) <- c("TF", "Target", "weight")
+linkList <- linkList[order(linkList[,"weight"], decreasing=TRUE),]
+save(linkList, file="./int/1.5_GENIE3_linkList.RData")
+```
+
+# Run SCENIC using the ‘Wrapper’
+This step was run in HPC. Here we load the previous saved object.
+```{r run_SCENIC}
+# library(SCENIC)
+# load("./int/forSCENIC.RData")
+# 
+# runSCENIC(exprMat=exprMat, org="mm9", cellInfo=cellInfo, colVars=colVars, nCores=24,
+#           stepsToRun=c("1.2", "2", "3.1", "3.2", "4"),
+#           seed = 123, verbose = TRUE, showAlternativeTsnes = TRUE)
+```
+
+# Visualize the binary regulon activity matrix of key transcriptional regulators
+## Load objects form SCENIC
+```{r}
+load("./int/forSCENIC.RData")
+load("int/3.6_binaryRegulonActivity.RData")
+load("int/3.7_binaryRegulonActivity_nonDupl.RData")
+```
+
+## Load URD objects
+### Select cells for each lineage
+We select cells for each lineage based on the trajecotry tree recovered by URD.
+```{r}
+urd.tree <- readRDS(file = "../URD/data/urd_treeView1.rds")
+TF.cascades <- readRDS("../URD/data/TF.cascades.rds")
+tips.to.run <- setdiff(as.character(urd.tree@tree$segment.names), c(NA,1,5))
+
+cell.list <- list()
+for (tipname in tips.to.run) {
+  seg.cells <- cellsAlongLineage(urd.tree, tipname, remove.root=F)
+  cell.list[[tipname]] <- seg.cells
+}
+names(cell.list) <- c("ETh","PTh","rPT","rTh","cTh","ZLI")
+```
+
+### Select transcription factors
+We select transcription that show signficantly dynamic expression during lineage specification. We also sort cells based on pseudotime to produce a matrix with binary regulon activity as row and cells as columne. 
+```{r}
+# Create lists to keep the cell ids for each lieage and significant TF
+regulon.cell <- list(TF.Regs=list(), TF = list(), cell.id=list(), common.id=list())
+par(mfrow = c(1, 2))
+for (n in 1:length(names(cell.list))){
+  tip <- names(cell.list)[[n]]
+  tipname <- tips.to.run[[n]]
+  TF.sig <- rownames(TF.cascades[[tipname]]$scaled.expression)
+  
+  cell.time <- urd.tree@pseudotime[cell.list[[tip]],]
+  cell.time <- cell.time[order(cell.time$pseudotime),]
+  cell.id <- rownames(cell.time)
+  
+  # select regulons that are active in > 5% cells
+  minCells <- length(cell.id)*.05
+  cell.id <- intersect(cell.id,colnames(binaryRegulonActivity_nonDupl))
+  regMinCells <- names(which(rowSums(binaryRegulonActivity_nonDupl[,cell.id]) > minCells))
+
+  # Correlation across regulons (based on binary cell activity)
+  reguCor <- cor(t(binaryRegulonActivity_nonDupl[regMinCells,cell.id]))
+  diag(reguCor) <- 0
+  
+  # Regulons that co-ocurr in similar cells. If a regulon is relevant by itself it will not be shown, also check the regulons ignored.
+  corrRegs <- names(which(rowSums(abs(reguCor) > 0.30) > 0))
+  
+  ## Set regulon order for plotting
+  binaryRegulonOrder <- hclust(as.dist(1-reguCor[corrRegs,corrRegs]))
+  binaryRegulonOrder <- binaryRegulonOrder$labels[binaryRegulonOrder$order]
+  
+  if(length(corrRegs)>1){
+    binaryMat <- binaryRegulonActivity[corrRegs,cell.id,drop=FALSE]
+    
+    # use gene symbol for plotting
+    gene.id <- gsub(" .*$", "", rownames(binaryMat))
+    gene.id <- gsub("_.*$", "", gene.id)
+    rownames(binaryMat) <- gene.id
+    
+    # annotate the transcription factors that are differentially expressed in the specific branch
+    anno <- rep("no", length(gene.id))
+    common.id <- intersect(gene.id,TF.sig)
+    anno[match(common.id,gene.id)] <- "yes"
+    names(anno) <- gene.id
+    
+    # save the cell ids and signficant regulator for impulse fits
+    regulon.cell[[tip]]$TF.Regs <- corrRegs
+    regulon.cell[[tip]]$TF <- gene.id
+    regulon.cell[[tip]]$cell.id <- cell.id
+    regulon.cell[[tip]]$common.id <- common.id
+    
+    NMF::aheatmap(binaryMat, scale="none", revC=F, Rowv=NULL, Colv=NA, main=tip,
+                  annRow=anno,annLegend = FALSE,
+                  color = c("gray97", "red"))
+  }
+}
+```
+
+## Modify geneCascadeImpulsePlots function to print plot for Figure 6I
+```{r}
+# modify the geneCascadeImpulsePlots function of make plots used in the figures
+impulse.single <- function(x, b1, h0, h1, t1) {
+  h0 + (h1 - h0)/(1 + exp(b1*(x - t1)))
+}
+
+impulse.double <- function(x, b1, b2, h0, h1, h2, t1, t2) {
+  f1 <- h0 + (h1 - h0)/(1 + exp(b1*(x - t1)))
+  f2 <- h2 + (h1 - h2)/(1 + exp(b2*(x - t2)))
+  sg1 <- f1*f2/h1
+  return(sg1)
+}
+
+geneCascadeImpulsePlots1 <- function(cascade, file=NULL, verbose=F) {
+  ncol <- ceiling(sqrt(length(cascade$impulse.fits)))
+  nrow <- ceiling(length(cascade$impulse.fits)/ncol)
+  if (!is.null(file)) {
+    pdf(file=file, width=ncol*4, height=nrow*4)
+  }
+  par(mfrow=c(nrow,ncol))
+  x <- as.numeric(names(cascade$scaled.expression))
+  for (g in names(cascade$impulse.fits)) {
+    if (verbose) print(g)
+    plot(x, cascade$scaled.expression[g,], pch=16, cex = .5, main=g, xlab="Pseudotime", ylab="Expression (scaled)")
+    i <- cascade$impulse.fits[[g]]
+    if (!is.na(i['type'])) {
+      if (i['type'] == 0) {
+        # abline(b=i["a"], a=i["b"], col=rgb(0,0,1,0.7), lwd=5)
+      }
+      if (i['type'] == 1) {
+        lines(x, impulse.single(x, b1=i['b1'], h0=i['h0'], h1=i['h1'], t1=i['t1']), col=rgb(0, 1, 0, 0.7), lwd=3)
+        # abline(h=i[c('h0','h1')], col=c('cyan','blue'))
+        abline(v=i[c('t1','time.on','time.off')], col=c('cyan', 'orange', 'magenta'))
+      } else {
+        lines(x, impulse.double(x, b1=i['b1'], b2=i['b2'], h0=i['h0'], h1=i['h1'], h2=i['h2'], t1=i['t1'], t2=i['t2']), col=rgb(1, 0, 0, 0.7), lwd=3)
+        # abline(h=i[c('h0','h1','h2')], col=c('cyan','green','blue'))
+        abline(v=i[c('t1','t2','time.on','time.off')], col=c('cyan', 'blue', 'orange', 'magenta'))
+      }
+    }
+  }  
+  if (!is.null(file)) {
+    dev.off()
+  }
+}
+```
+
+
+# Examine temporal profiles of the regulon activity in lineage specification
+We use regulonAUC to create a URD object and apply geneCascadeProcess to generate impulse fits of regulonAUC
+```{r fig.asp = 1}
+load("./int/3.2_regulonAUC.RData")
+regulon.AUC <- getAuc(regulonAUC)[,colnames(urd.tree@logupx.data)]
+gene.id <- gsub(" .*$", "", rownames(regulon.AUC))
+gene.id <- gsub("_.*$", "", gene.id)
+regulon.AUC.matrix <- regulon.AUC
+rownames(regulon.AUC.matrix) <- gene.id
+
+urd.AUC <- urd.tree
+urd.AUC@logupx.data <- as(regulon.AUC.matrix, "dgCMatrix")
+
+# Create impulse fit for rTh
+tip <- "rTh"
+regulon.sel <- regulon.AUC[regulon.cell[[tip]]$TF.Regs,regulon.cell[[tip]]$cell.id]
+rownames(regulon.sel) <- regulon.cell[[tip]]$TF
+  
+urd.sub <- urdSubset(urd.tree, cells.keep = regulon.cell[[tip]]$cell.id)
+  
+casc <- geneCascadeProcess(object = urd.AUC, pseudotime='pseudotime', cells = regulon.cell[[tip]]$cell.id, 
+                             background.genes = setdiff(regulon.cell[[tip]]$TF,regulon.cell[[tip]]$common.id),
+                             genes= regulon.cell[[tip]]$common.id, 
+                             moving.window=3, cells.per.window= 8, limit.single.sigmoid.slopes = "on", verbose = F)
+  
+ncol <- ceiling(sqrt(length(casc$impulse.fits)))
+nrow <- ceiling(length(casc$impulse.fits)/ncol)
+  
+geneCascadeImpulsePlots1(casc)
+
+# Print impulse modle of regulonAUC for all lineages
+for (n in 1:length(names(cell.list))){
+  tip <- names(cell.list)[[n]]
+  
+  regulon.sel <- regulon.AUC[regulon.cell[[tip]]$TF.Regs,regulon.cell[[tip]]$cell.id]
+  rownames(regulon.sel) <- regulon.cell[[tip]]$TF
+  
+  urd.sub <- urdSubset(urd.tree, cells.keep = regulon.cell[[tip]]$cell.id)
+  
+  
+  casc <- geneCascadeProcess(object = urd.AUC, pseudotime='pseudotime', cells = regulon.cell[[tip]]$cell.id, 
+                             background.genes = setdiff(regulon.cell[[tip]]$TF,regulon.cell[[tip]]$common.id),
+                             genes= regulon.cell[[tip]]$common.id, 
+                             moving.window=3, cells.per.window= 8, limit.single.sigmoid.slopes = "on", verbose = F)
+  
+  ncol <- ceiling(sqrt(length(casc$impulse.fits)))
+  nrow <- ceiling(length(casc$impulse.fits)/ncol)
+  
+  pdf(paste0("./output/regulonAUC_CascadePlot_",tip,".pdf"), w = 2*ncol, h = 2*nrow)
+  geneCascadeImpulsePlots1(casc)
+  dev.off()
+}
+
+```
+```{r}
+load("./int/3.2_regulonAUC.RData")
+regulon.AUC <- getAuc(regulonAUC)[,colnames(urd.tree@logupx.data)]
+gene.id <- gsub(" .*$", "", rownames(regulon.AUC))
+gene.id <- gsub("_.*$", "", gene.id)
+regulon.AUC.matrix <- regulon.AUC
+rownames(regulon.AUC.matrix) <- gene.id
+
+urd.AUC <- urd.tree
+urd.AUC@logupx.data <- as(regulon.AUC.matrix, "dgCMatrix")
+
+TF.list <- c("Ascl1","Tal1","Gata2","Gata3","Otx1","Emx2","Uncx","Lhx1","Sox14")
+
+# Grey-blue-green color scheme for module and gene expression
+fire.with.grey <- c("#CECECE", "#DDC998", RColorBrewer::brewer.pal(9, "YlOrRd")[3:9])
+
+for (gene in TF.list) {
+  plotTreeForce(urd.tree, gene, alpha=0.7, alpha.fade=0.1, size= 10, density.alpha=T, label.tips=F, view = "View1",
+                colors = fire.with.grey)
+  Sys.sleep(0.2)
+  rgl::rgl.snapshot(file = paste0("./output/TreeForce_gene_",gene,".png"))
+  rgl::rgl.close()
+}
+
+for (gene in TF.list) {
+  plotTreeForce(urd.AUC, gene, alpha=0.7, alpha.fade=0.1, size= 10, density.alpha=T, label.tips=F, view = "View1",
+                colors = fire.with.grey)
+  Sys.sleep(0.2)
+  rgl::rgl.snapshot(file = paste0("./output/TreeForce_regulon_",gene,".png"))
+  rgl::rgl.close()
+}
+```
+
+## Load URD objects
+### Select cells for each lineage
+We select cells for each lineage based on the trajecotry tree recovered by URD.
+```{r}
+urd.tree <- readRDS(file = "../URD/data/urd_treeView1.rds")
+
+```
+
+# Examine temporal profiles of the regulon activity in lineage specification
+We use regulonAUC to create a URD object and apply geneCascadeProcess to generate impulse fits of regulonAUC
+```{r fig.asp = 1}
+load("./int/3.2_regulonAUC.RData")
+regulon.AUC <- getAuc(regulonAUC)[,colnames(urd.tree@logupx.data)]
+# gene.id <- gsub(" .*$", "", rownames(regulon.AUC))
+# gene.id <- gsub("_.*$", "", gene.id)
+# regulon.AUC.matrix <- regulon.AUC
+# rownames(regulon.AUC.matrix) <- gene.id
+
+urd.AUC <- urd.tree
+urd.AUC@logupx.data <- as(regulon.AUC.matrix, "dgCMatrix")
+```
+
+```{r}
+tips.to.run <- setdiff(as.character(urd.tree@tree$segment.names), c(NA,1,5))
+
+colnames(urd.AUC@meta) <- c("n.Genes","n.Trans","orig.ident","percent.mito","tree.ident","clust")
+
+genes.use <- NULL 
+gene.markers <- list()
+markers.sum <- NULL
+for (tipn in 1:length(tips.to.run)) {
+  tip <- tips.to.run[tipn]
+  print(paste0(Sys.time(), ": ", tip))
+  markers <- aucprTestAlongTree(urd.AUC, pseudotime = "pseudotime", tips = tip, log.effect.size = 0.25,
+                                auc.factor = 1, max.auc.threshold = 1, frac.must.express = 0.1,
+                                frac.min.diff = 0.1, genes.use = NULL, root = NULL,
+                                segs.to.skip = NULL, only.return.global = F, must.beat.sibs = 0.5,
+                                report.debug = T)
+  gene.markers[[tip]] <- markers
+  res <- markers[[1]]
+  res$tip <- tip
+  res$gene <- rownames(res)
+  res$TF <- mGenes$Type[match(res$gene,mGenes$mgi_symbol)]
+  res$description <- mGenes$description[match(res$gene,mGenes$mgi_symbol)]
+  markers.sum <- rbind(markers.sum, res)
+}
+saveRDS(gene.markers, "./data/cascadeMarkers_all.rds")
+openxlsx::write.xlsx(markers.sum, file = "./tables/cascadeMarkers_all.xlsx")
+```
+
+
+# Print data and session information
+```{r}
+date()
+sessionInfo()
+```
+

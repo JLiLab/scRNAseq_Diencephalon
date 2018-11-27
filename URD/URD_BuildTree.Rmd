@@ -1,0 +1,231 @@
+---
+title: "Construct developmental trajectories of E12.5 diencephaloic cells"
+linestretch: 0.5
+output:
+ html_notebook: default
+ pdf_document:
+   latex_engine: xelatex
+---
+
+\fontsize{8}{18}
+
+# Load libraies
+```{r mesasge=FALSE, error=FALSE, include=FALSE, autodep=TRUE}
+library(URD);library(cowplot);library(rgl);library(knitr)
+```
+
+```{r}
+urd <- readRDS(file="./data/object_dm4.rds")
+```
+
+# Biased Random Walks
+
+## Define parameters of logistic function to bias transition probabilities
+To determine the logistic parameters, we defined what is considered ‘appreciably younger’ or ‘appreciably older’. To do this, we ordered all cells’ pseudotime in increasing order, empirically chose an interval of 40 cells, which we then used to defined a lower bound of pseudotime difference for similarly pseudotimed cells, below which cells are considered ‘appreciably younger’. The upper bound of pseudotime difference for similarly pseudotimed cells above which cells are considered ‘appreciably older’ was determined similarly by choosing an interval of 80 cells. 
+```{r}
+root.cells <- cellsInCluster(urd, "class", "Root")
+
+# generate R objects to run BiasedRandomeWlaks in the cluster
+tip.id <- setdiff(unique(urd@group.ids[,"tip.num"]), NA)
+tip.cells <- vector('list',length(tip.id))
+for (j in tip.id){
+  tip.cells[[j]] <- rownames(urd@group.ids)[which(urd@group.ids[,"tip.Num"] == j)]
+}
+names(tip.cells) <- tip.id
+
+# Define parameters of logistic function to bias transition probabilities
+diffusion.logistic <- pseudotimeDetermineLogistic(urd, "pseudotime", optimal.cells.forward=40, max.cells.back=80, pseudotime.direction="<", do.plot=T, print.values=T)
+
+# Create biased transition matrix
+biased.tm <- pseudotimeWeightTransitionMatrix(urd, pseudotime = "pseudotime", logistic.params = diffusion.logistic, pseudotime.direction = "<")
+# save(root.cells, tip.cells, biased.tm, file = "./data/forRandomWalks_dm4.RData")
+```
+
+# To perform random walks, we run the following R script on the cluster using a shell script to parallelize walking from each tip. The output was collected in the "walk_all" folder.
+After biasing the transition probabilities, random walks were simulated by first choosing a random cell from each tip, then repeatedly choosing a random cell to move to, weighted by the biased transition probabilities. The walk was continued until it visited a root cell. The overall frequency of visitation of each
+cell by biased random walks starting from each tip was then calculated and used in downstream analyses. We simulated 100,000 biased random walks from each tip. The random walks were subsampled to ensure that relative visitation frequencies had stabilized by 250,000 walks.
+```{r}
+# grab the array id value from the environment variable passed from sbatch
+slurm_arrayid <- Sys.getenv('SLURM_ARRAY_TASK_ID')
+n <- as.numeric(slurm_arrayid)
+
+load("./data/forRandomWalks_dm4.RData")
+tip.cell.id <- tip.cell[[n]]
+tip.to.walk <- names(tip.cell[n])
+walks.to.do <- 250000
+
+print(paste0("array id = ", slurm_arrayid))
+print(paste0("BiasedRandomWalk from tip cell_", tip.to.walk, "; n = ", walks.to.do))
+
+walks <- simulateRandomWalk(start.cells = tip.cell.id, transition.matrix = biased.tm, end.cells = root.cells, n = walks.to.do, 
+                                  end.visits = 1, verbose.freq = round(walks.to.do/20), max.steps = 5000)
+saveRDS(walks, file = paste0("walks-", tip.to.walk, ".rds"))
+```
+
+# Load and process random walk results.
+```{r load-object}
+path = "./walks_all/"
+
+# Select the tips used for random walks
+tips.walked <- setdiff(unique(urd@group.ids[,"tip.num"]), NA)
+
+# Run through each tip, load the walks, and process them into visitation frequency for that tip
+for (tip in tips.walked) {
+  these.walks <- readRDS(paste0(path, "walks-", tip, ".rds"))
+  urd <<- processRandomWalks(urd, walks=these.walks, walks.name=tip, verbose=F)
+}
+```
+
+# Generate the trajectory tree
+First, cells were putatively assigned to all segments for which their visitation frequency was greater than 70% of their maximum visitation frequency from any tip. For each pair of segments, we found the pseudotime of a putative branchpoint between the two segments. To do this, we combined all cells that were putative members of either segment, and used a moving window along pseudotime (a window containing 80 cells, and moving 5 cells at a time); within each window, we calculated whether those cells were visited with significantly different frequencies by biased random walks from the two tips under consideration. Significance was calculated with a two-sample Kolmogorov- Smirnov (KS) test. The resultant p-values were corrected for multiple hypotheses. We set the threshold at ≤ 0.001. Any segment that was overly short in pseudotime (< 0.01) or had too few associated cells (< 10 cells) was eliminated, and its children were then associated with that segment’s parent. 
+
+```{r}
+# Generate the hierarchical tree
+urd.tree <- loadTipCells(urd, "tip.num") 
+tip.id <- setdiff(unique(urd.tree@group.ids$tip.num),c(NA,1,5))
+urd.tree <- buildTree(urd.tree, pseudotime = "pseudotime", tips.use = tip.id, divergence.method = "ks", 
+                      cells.per.pseudotime.bin = 80, bins.per.pseudotime.window = 5, minimum.visits = 10,
+                      visit.threshold = 0.7, use.only.original.tips = T,
+                      save.all.breakpoint.info = T, p.thresh=0.001,
+                      dendro.node.size = 100, min.cells.per.segment = 10, min.pseudotime.per.segment = .01, verbose = T)
+# saveRDS(urd.tree, file=("./data/urd_tree.rds"))
+```
+
+# Name the tips
+
+```{r}
+# Name the segments based on our previous determination of the identity of tips 1 and 2.
+urd.tree <- nameSegments(urd.tree, segments= tip.id, segment.names = c("Pretectum", "Habenula","Thalamus","RostralThalamus","ZonaLimitansIntrathalamica","Prethalamus"), 
+                         short.names = c("PT","Hb","Th","rTh","ZLI","PreTh"))
+```
+
+# Print tree
+For figures in the manuscript, we renamed the tips with these abreviations: cTh, caudal thalamus; ETh, epithalalmus; rPT, rostral pretectum; rTh, rostral thalamus; PTh, prethalamus; ZLI, zona limitance intrathalamica
+```{r}
+urd.tree1 <- urd.tree
+urd.tree1 <- nameSegments(urd.tree1, segments= tip.id, segment.names = c("rPT", "ETh","cTh","rTh","ZLI","PTh"))
+
+p1 <- plotTree(urd.tree1, "segment",label.segments=T,title="URD tree segment")
+p2 <- plotDim(urd.tree1, "segment",label.clusters = T, legend = F, plot.title="URD tree segment")
+plot(plot_grid(p1,p2, ncol = 2))
+```
+
+# Inspect gene expression in the dendrograph
+We examine the expression of a few known markers to validate the trajectory tree.
+
+```{r}
+gridExtra::grid.arrange(grobs=list(
+  plotTree(urd.tree1, "Pitx2", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25),
+  plotTree(urd.tree1, "Tac1", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25),
+  plotTree(urd.tree1, "Cd47", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25),
+  plotTree(urd.tree1, "C1ql2", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25),
+  plotTree(urd.tree1, "Gata3", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25),
+  plotTree(urd.tree1, "Dlx5", tree.size = 1, cell.alpha = 0.5, cell.size = 0.25)
+), ncol = 3)
+```
+
+
+# Generate a force-directed layout
+## Choose cells that were visited more robustly
+```{r}
+# Data frame to measure cell visitation
+visitation <- data.frame(
+  cell=rownames(urd.tree@diff.data),
+  seg=urd.tree@diff.data$segment,
+  stringsAsFactors=F, row.names=rownames(urd.tree@diff.data)
+)
+visitation$visit <- log10(apply(visitation, 1, function(cr) urd.tree@diff.data[as.character(cr['cell']), paste0("visitfreq.raw.", as.character(cr['seg']))])+1)
+
+# Choose those cells that were well visited
+robustly.visited.cells <- visitation[visitation$visit >= 0.5, "cell"]
+
+# Since some tips of the tree were combined in their entirety, get the terminal segments to use as the tips of the force-directed layout.
+final.tips <- segTerminal(urd.tree)
+```
+
+## Choose the number of nearest neighbors
+Here, we generate the force-directed layout by varying the number of nearest neighbors (num.nn).
+```{r rgl=T, out.width="3in", out.height="3in"}
+par(mfrow=c(3,2))
+for (k in c(80:85)){
+  urd.tree <- treeForceDirectedLayout(urd.tree, num.nn = k, method = "fr", cells.to.do = robustly.visited.cells, cut.outlier.cells = NULL,
+                                      cut.outlier.edges = NULL, max.pseudotime.diff = NULL,
+                                      cut.unconnected.segments = 2, min.final.neighbors = 4,
+                                      tips = final.tips, coords = "auto", start.temp = NULL,
+                                      density.neighbors = 10, plot.outlier.cuts = F, verbose = F)
+  
+  plotTreeForce(urd.tree, "segment", alpha=1)
+}
+```
+
+## Change the cut.unconnected.segments
+
+```{r}
+for (j in c(2,4,6,8)){
+  urd.tree <- treeForceDirectedLayout(urd.tree, num.nn = 80, method = "fr", cells.to.do = robustly.visited.cells,
+                                      cut.outlier.cells = NULL,
+                                      cut.outlier.edges = NULL, max.pseudotime.diff = NULL,
+                                      cut.unconnected.segments = j, min.final.neighbors = 4,
+                                      tips = final.tips, coords = "auto", start.temp = NULL,
+                                      density.neighbors = 10, plot.outlier.cuts = F, verbose = F)
+  
+  plotTreeForce(urd.tree, "segment", alpha=1)
+}
+```
+
+## Calculate the layout that is used in the paper.
+
+```{r}
+# use the optimal parameters
+urd.tree <- treeForceDirectedLayout(urd.tree, num.nn = 80, method = "fr", cells.to.do = robustly.visited.cells,
+                                    cut.outlier.cells = NULL,
+                                    cut.outlier.edges = NULL, max.pseudotime.diff = NULL,
+                                    cut.unconnected.segments = 2, min.final.neighbors = 4,
+                                    tips = final.tips, coords = "auto", start.temp = NULL,
+                                    density.neighbors = 10, plot.outlier.cuts = F, verbose = T)
+
+plotTreeForce(urd.tree, "segment", alpha=1)
+```
+
+## Rotate the tree and save the view that is used in the manuscript.
+
+```{r, echo=TRUE}
+# urd.build <- plotTreeForceStore3DView(urd.tree, "View1")
+# saveRDS(urd.build, file=paste0("./data/urd_treeView1.rds"))
+
+# Load previous saved object
+urd.build <- readRDS(file=paste0("./data/urd_treeView1.rds"))
+
+plotTreeForce(urd.build, "segment", alpha=0.7, alpha.fade=0.08, size=4, density.alpha=T, label.tips=T, view = "View1")
+rglwidget()
+# Sys.sleep(0.2)
+# rgl::rgl.snapshot(file = "./figures/TreeForce.png")
+# rgl::rgl.close()
+```
+
+## Check out gene expression in the force-directed layout 
+
+```{r}
+plotTreeForce(urd.build, "Gbx2", alpha=0.2, view="View1")
+rglwidget()
+```
+
+## Check out gene expression in the force-directed layout 
+
+```{r}
+fire.with.grey <- c("#CECECE", "#DDC998", RColorBrewer::brewer.pal(9, "YlOrRd")[3:9])
+
+geneList <- c("Gbx2", "Pou4f1","Bhlhe23","Dlx5","Sox14","Pitx2")
+for (gene in geneList) {
+    plotTreeForce(urd.build, gene, alpha=0.7, alpha.fade=0.1, size= 10, density.alpha=T, label.tips=F, view = "View1",
+                  colors = fire.with.grey)
+  Sys.sleep(0.2)
+  rgl::rgl.snapshot(file = paste0("./figures/TreeForce_",gene,".png"))
+  rgl::rgl.close()
+}
+```
+
+
+```{r}
+sessionInfo()
+```

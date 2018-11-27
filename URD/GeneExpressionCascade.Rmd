@@ -1,0 +1,527 @@
+---
+title: "Determination of gene expression cascades along URD-inferred trajecotries"
+linestretch: 0.5
+output:
+ html_notebook: default
+ pdf_document:
+   latex_engine: xelatex
+---
+\fontsize{8}{18}
+
+# Load packages
+```{r load-packages, message=F, warning=F}
+library(URD);library(cowplot)
+```
+
+# Load previous saved object
+
+```{r load object}
+urd.tree <- readRDS(file = "./data/urd_treeView1.rds")
+mGenes <- readRDS("./data/Annotation.rds")
+```
+
+# Perform precision-recall tests along trajectory tree  
+## Identify differentially expressed genes of each cell lineage  
+
+```{r}
+tips.to.run <- setdiff(as.character(urd.tree@tree$segment.names), c(NA,1,5))
+
+colnames(urd.tree@meta) <- c("n.Genes","n.Trans","orig.ident","percent.mito","tree.ident","clust")
+
+genes.use <- NULL 
+gene.markers <- list()
+markers.sum <- NULL
+for (tipn in 1:length(tips.to.run)) {
+  tip <- tips.to.run[tipn]
+  print(paste0(Sys.time(), ": ", tip))
+  markers <- aucprTestAlongTree(urd.tree, pseudotime = "pseudotime", tips = tip, log.effect.size = 0.25,
+                                auc.factor = 1, max.auc.threshold = 1, frac.must.express = 0.1,
+                                frac.min.diff = 0.1, genes.use = NULL, root = "1",
+                                segs.to.skip = NULL, only.return.global = F, must.beat.sibs = 0.5,
+                                report.debug = T)
+  gene.markers[[tip]] <- markers
+  res <- markers[[1]]
+  res$tip <- tip
+  res$gene <- rownames(res)
+  res$TF <- mGenes$Type[match(res$gene,mGenes$mgi_symbol)]
+  res$description <- mGenes$description[match(res$gene,mGenes$mgi_symbol)]
+  markers.sum <- rbind(markers.sum, res)
+}
+saveRDS(gene.markers, "./data/cascadeMarkers_all.rds")
+openxlsx::write.xlsx(markers.sum, file = "./tables/cascadeMarkers_all.xlsx")
+```
+
+```{r}
+# Separate actual marker lists from the stats lists
+gene.markers.de <- lapply(gene.markers, function(x) x[[1]])
+gene.markers.stats <- lapply(gene.markers, function(x) x[[2]])
+names(gene.markers.de) <- names(gene.markers)
+names(gene.markers.stats) <- names(gene.markers)
+```
+
+## Examine the relationsip between DE genes and library complexity
+
+```{r}
+# Compile all comparison stats into a single table
+all.de.stats <- do.call("rbind", gene.markers.stats)
+all.de.stats$tip <- substr(rownames(all.de.stats),1,nchar(rownames(all.de.stats))-2)
+
+# Do a few plots
+p1 <- ggplot(all.de.stats, aes(x=pt.1.mean, y=pt.2.mean)) + geom_point() + theme_bw() + geom_abline(slope = 1, intercept=0, col='red', lty=2) + labs(x="Mean Pseudotime (Group 1)", y="Mean Pseudotime (Group 2)")
+p2 <- ggplot(all.de.stats, aes(x=genes.1.mean, y=genes.2.mean)) + geom_point() + theme_bw() + geom_abline(slope = 1, intercept=0, col='red', lty=2) + labs(x="Mean Detected Genes (Group 1)", y="Mean Detected Genes (Group 2)")
+p3 <- ggplot(all.de.stats, aes(x=trans.1.mean, y=trans.2.mean)) + geom_point() + theme_bw() + geom_abline(slope = 1, intercept=0, col='red', lty=2) + labs(x="Mean Transcripts (Group 1)", y="Mean Transcripts (Group 2)")
+
+cowplot::plot_grid(p1,p2,p3, ncol = 3)
+```
+
+# Determine temporal gene expression with impulse fitting
+
+```{r}
+gene.cascades <- lapply(tips.to.run, function(tip) {
+  print(paste0(Sys.time(), ": Impulse Fit ", tip))
+  seg.cells <- cellsAlongLineage(urd.tree, tip, remove.root=F)
+  casc <- geneCascadeProcess(object = urd.tree, pseudotime='pseudotime', cells = seg.cells, 
+                             genes= rownames(gene.markers.de[[tip]]), 
+                             moving.window=5, cells.per.window=18, 
+                             limit.single.sigmoid.slopes = "on", verbose = T)
+  return(casc)
+})
+names(gene.cascades) <- tips.to.run
+saveRDS(gene.cascades, file = "./data/allGene.cascades.rds")
+```
+
+## Create a table of markers genes with timing
+
+```{r}
+markers.sum <- NULL
+for (tip in tips.to.run) {
+  res <- gene.markers.de[[tip]]
+  res$tip <- tip
+  cascade <- gene.cascades[[tip]]
+  
+  # Correct for NA timings
+  timing <- cascade$timing
+  timing[intersect(which(is.na(timing$time.on)), which(is.infinite(timing$time.off))), "time.on"] <- Inf
+  res <- cbind(res,timing)
+  gene.order <- order(timing$time.on, timing$time.off, na.last=F)
+  res <- res[gene.order,]
+  res$gene <- rownames(res)
+  res$TF <- mGenes$Type[match(res$gene,mGenes$mgi_symbol)]
+  res$description <- mGenes$description[match(res$gene,mGenes$mgi_symbol)]
+  markers.sum <- rbind(markers.sum, res)
+}
+head(markers.sum)
+openxlsx::write.xlsx(markers.sum, file = "./tables/cascadeMarkers_all.xlsx")
+```
+
+## Generate heatmaps to show gene expression landscapes during cell fate specification
+
+```{r}
+# include genes affected by Gbx2 deletion
+Gbx2.targets <- openxlsx::read.xlsx("./tables/Gbx2_targets.xlsx")
+Gbx2.up <- Gbx2.targets$Symbol[Gbx2.targets$logFC>0]
+Gbx2.dn <- Gbx2.targets$Symbol[Gbx2.targets$logFC<0]
+
+for (tip in tips.to.run) {
+  gene.num <- nrow(gene.cascades[[tip]]$scaled.expression)
+  genes <- rownames(gene.cascades[[tip]]$scaled.expression)
+  anno <- list(red=intersect(Gbx2.up,genes),
+               blue=intersect(Gbx2.dn,genes),
+               grey=setdiff(genes,Gbx2.targets$Symbol))
+  
+  pdf(paste0("./figures/cascades_",tip,".pdf"), w = 4, h = 0.08*gene.num)
+  geneCascadeHeatmap(cascade=gene.cascades[[tip]], title = tip, 
+                     annotation.list=anno, row.font.size = 0.008*gene.num)
+  dev.off()
+}
+```
+
+# Identify differentially expressed transcription factors in each lineage
+
+```{r}
+genes.use <- intersect(rownames(urd.tree@logupx.data),mGenes[which(mGenes$Type > "nonTF"), "mgi_symbol"])
+
+TF.markers <- list()
+for (tipn in 1:length(tips.to.run)) {
+  tip <- tips.to.run[tipn]
+  print(paste0(Sys.time(), ": ", tip))
+  markers <- aucprTestAlongTree(urd.tree, pseudotime = "pseudotime", tips = tip, log.effect.size = 0.25,
+                                auc.factor = 1, max.auc.threshold = 1, frac.must.express = 0.1,
+                                frac.min.diff = 0.1, genes.use = genes.use, root = "1",
+                                segs.to.skip = NULL, only.return.global = F, must.beat.sibs = 0.5,
+                                report.debug = T)
+  TF.markers[[tip]] <- markers
+}
+saveRDS(TF.markers, "./data/cascadeMarkers_TFonly.rds")
+```
+
+# Perform impulse fits for transcription factors only 
+
+```{r}
+TF.markers.de <- lapply(TF.markers, function(x) x[[1]])
+names(TF.markers.de) <- names(TF.markers)
+TF.cascades <- lapply(tips.to.run, function(tip) {
+  print(paste0(Sys.time(), ": Impulse Fit ", tip))
+  seg.cells <- cellsAlongLineage(urd.tree, tip, remove.root=F)
+  casc <- geneCascadeProcess(object = urd.tree, pseudotime='pseudotime', cells = seg.cells, genes= rownames(TF.markers.de[[tip]]), 
+                             background.genes = sample(setdiff(rownames(urd.tree@logupx.data),urd.tree@var.genes), 1000),
+                             moving.window=3, cells.per.window=10, limit.single.sigmoid.slopes = "on", verbose = T)
+  return(casc)
+})
+names(TF.cascades) <- tips.to.run
+saveRDS(TF.cascades, "./data/TF.cascades.rds")
+```
+
+## Print transcription factors cascade impulse plots
+
+```{r}
+for (tip in tips.to.run) {
+  gene.num <- nrow(TF.cascades[[tip]]$scaled.expression)
+
+  pdf(paste0("./figures/geneCascadePlot_",tip,".pdf"), w = 0.55*gene.num, h = 0.55*gene.num)
+  geneCascadeImpulsePlots(TF.cascades[[tip]])
+  dev.off()
+}
+```
+
+## Identify differentially expressed transcription factors in each lineage (higher stringency).
+We increase the cutoff to focus on fewer genes and plot them in impulse plot shown in Supplementary figure S3.
+```{r}
+genes.use <- intersect(rownames(urd.tree@logupx.data),mGenes[which(mGenes$Type > "nonTF"), "mgi_symbol"])
+
+TF.markers <- list()
+for (tipn in 1:length(tips.to.run)) {
+  tip <- tips.to.run[tipn]
+  print(paste0(Sys.time(), ": ", tip))
+  markers <- aucprTestAlongTree(urd.tree, pseudotime = "pseudotime", tips = tip, log.effect.size = 0.5,
+                                auc.factor = 1, max.auc.threshold = 1, frac.must.express = 0.1,
+                                frac.min.diff = 0.1, genes.use = genes.use, root = NULL,
+                                segs.to.skip = NULL, only.return.global = F, must.beat.sibs = 0.5,
+                                report.debug = T)
+  TF.markers[[tip]] <- markers
+}
+```
+
+## Perform impulse fits for transcription factors only 
+
+```{r}
+TF.markers.de <- lapply(TF.markers, function(x) x[[1]])
+names(TF.markers.de) <- names(TF.markers)
+TF.cascades <- lapply(tips.to.run, function(tip) {
+  print(paste0(Sys.time(), ": Impulse Fit ", tip))
+  seg.cells <- cellsAlongLineage(urd.tree, tip, remove.root=F)
+  casc <- geneCascadeProcess(object = urd.tree, pseudotime='pseudotime', cells = seg.cells, genes= rownames(TF.markers.de[[tip]]),
+                             background.genes = sample(setdiff(rownames(urd.tree@logupx.data),urd.tree@var.genes), 1000),
+                             moving.window=4, cells.per.window= 6, limit.single.sigmoid.slopes = "off", verbose = T)
+  return(casc)
+})
+names(TF.cascades) <- tips.to.run
+```
+
+
+```{r}
+# modify the geneCascadeImpulsePlots function of make plots used in the figures
+geneCascadeImpulsePlots1 <- function(cascade, file=NULL, verbose=F) {
+  ncol <- ceiling(sqrt(length(cascade$impulse.fits)))
+  nrow <- ceiling(length(cascade$impulse.fits)/ncol)
+  if (!is.null(file)) {
+    pdf(file=file, width=ncol*4, height=nrow*4)
+  }
+  par(mfrow=c(nrow,ncol))
+  x <- as.numeric(names(cascade$scaled.expression))
+  for (g in names(cascade$impulse.fits)) {
+    if (verbose) print(g)
+    plot(x, cascade$scaled.expression[g,], pch=16, cex = .5, main=g, xlab="Pseudotime", ylab="Expression (scaled)")
+    i <- cascade$impulse.fits[[g]]
+    if (!is.na(i['type'])) {
+      if (i['type'] == 0) {
+        abline(b=i["a"], a=i["b"], col=rgb(0,0,1,0.7), lwd=5)
+      }
+      if (i['type'] == 1) {
+        lines(x, impulse.single(x, b1=i['b1'], h0=i['h0'], h1=i['h1'], t1=i['t1']), col=rgb(0, 1, 0, 0.7), lwd=5)
+        abline(h=i[c('h0','h1')], col=c('cyan','blue'))
+        abline(v=i[c('t1','time.on','time.off')], col=c('cyan', 'orange', 'magenta'))
+      } else {
+        lines(x, impulse.double(x, b1=i['b1'], b2=i['b2'], h0=i['h0'], h1=i['h1'], h2=i['h2'], t1=i['t1'], t2=i['t2']), col=rgb(1, 0, 0, 0.7), lwd=5)
+        abline(h=i[c('h0','h1','h2')], col=c('cyan','green','blue'))
+        abline(v=i[c('t1','t2','time.on','time.off')], col=c('cyan', 'blue', 'orange', 'magenta'))
+      }
+    }
+  }  
+  if (!is.null(file)) {
+    dev.off()
+  }
+}
+```
+
+## Print TF gene cascade impulse plots for each lineage
+
+```{r}
+for (tip in tips.to.run) {
+  ncol <- ceiling(sqrt(length(TF.cascades[[tip]]$impulse.fits)))
+  nrow <- ceiling(length(TF.cascades[[tip]]$impulse.fits)/ncol)
+  
+  pdf(paste0("./impulse/geneCascadePlot_",tip,".pdf"), w = 2*ncol, h = 2*nrow)
+  geneCascadeImpulsePlots1(TF.cascades[[tip]])
+  dev.off()
+}
+```
+
+
+# Identify markers of each lineage
+## Find marker of rostral thalamus
+```{r}
+markers.sum$marker <- NA
+markers.sum1 <- NULL
+
+# Find marker of rostral thalamus
+tip <- "RostralThalamus"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+
+# Determine which genes are also global markers
+cells <- cellsInCluster(urd.tree, "segment", c("6"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "rTh"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+```
+
+## Find marker of caudal thalamus
+
+```{r}
+tip <- "Thalamus"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+cells <- cellsInCluster(urd.tree, "segment", c("7"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3.0, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "cTh"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+```
+
+## Find marker of pretectum
+
+```{r}
+tip <- "Prethalamus"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+cells <- cellsInCluster(urd.tree, "segment", c("3"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3.0, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "PTh"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+```
+
+## Find marker of epithalamus
+
+```{r}
+tip <- "Habenula"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+cells <- cellsInCluster(urd.tree, "segment", c("2"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3.0, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "ETh"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+```
+
+## Find marker of prethalamus
+
+```{r}
+tip <- "Pretectum"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+cells <- cellsInCluster(urd.tree, "segment", c("4"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3.0, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "PT"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+```
+
+## Find marker of ZLI
+
+```{r}
+tip <- "ZonaLimitansIntrathalamica"
+cascade <- gene.cascades[[tip]]
+markers <- rownames(cascade$scaled.expression)
+cells <- cellsInCluster(urd.tree, "segment", c("8"))
+markers.global <- markersAUCPR(urd.tree, cells.1 = cells, cells.2 = NULL, genes.use = markers, clustering = "segment")
+marker.thresh <- aucprThreshold(cells.1 = cells, cells.2 = setdiff(unlist(urd.tree@tree$cells.in.segment), cells), factor = 3.0, max.auc = Inf) # lower the stringency by reducing the factor 
+de.markers <- markers.global[markers.global$AUCPR >= marker.thresh,];nrow(de.markers)
+markers.sum$marker[markers.sum$tip == tip & markers.sum$gene %in% rownames(de.markers)] <- de.markers$cellType <- "ZLI"
+de.markers$gene <- rownames(de.markers)
+markers.sum1 <- rbind(markers.sum1, de.markers)
+
+markers.sum1$type <- mGenes$Type[match(markers.sum1$gene,mGenes$mgi_symbol)]
+markers.sum1$description <- mGenes$description[match(markers.sum1$gene,mGenes$mgi_symbol)]
+
+# show the number of lineage markers
+table(markers.sum$marker)
+openxlsx::write.xlsx(markers.sum, file = "./tables/cascadeMarkers_all1.xlsx")
+openxlsx::write.xlsx(markers.sum1, file = "./tables/lineageMarkers.xlsx")
+```
+
+# Inspect thalamis-specific markers on force-directed layout tree
+
+```{r}
+marker <- openxlsx::read.xlsx("./tables/lineageMarkers.xlsx")
+Th.genes <- openxlsx::read.xlsx("./tables/Gbx2_targets.xlsx", sheet = 2)
+Th.known <- c(Th.genes$Symbol,"Prokr2","Slc18a2") # add two more genes that were shown in the paper by Mallika et al. 
+Th.markers <- marker$gene[marker$cellType=="cTh"]
+intersect(Th.markers,Th.known) > 0
+
+# Grey-blue-green color scheme for module and gene expression
+pond.with.grey <- c("#CECECE", "#CBDAC2", RColorBrewer::brewer.pal(9, "YlGnBu")[3:9])
+fire.with.grey <- c("#CECECE", "#DDC998", RColorBrewer::brewer.pal(9, "YlOrRd")[3:9])
+
+for (gene in intersect(Th.markers,Th.known)) {
+  plotTreeForce(urd.tree, gene, alpha=0.7, alpha.fade=0.1, size= 10, density.alpha=T, label.tips=F, view = "View1",
+                colors = fire.with.grey)
+  Sys.sleep(0.2)
+  rgl::rgl.snapshot(file = paste0("./figures/TreeForce_cTh_",gene,".png"))
+  rgl::rgl.close()
+}
+
+for (gene in setdiff(Th.markers,Th.known)) {
+  plotTreeForce(urd.tree, gene, alpha=0.7, alpha.fade=0.1, size= 10, density.alpha=T, label.tips=F, view = "View1",
+                colors = pond.with.grey)
+  Sys.sleep(0.2)
+  rgl::rgl.snapshot(file = paste0("./figures/TreeForce_cTh_",gene,".png"))
+  rgl::rgl.close()
+}
+```
+
+# Preference plot at the branchpoint between pretectum and thalamus
+## Define the preference layout for the branchpoint
+
+```{r}
+layout1 <- branchpointPreferenceLayout(urd.tree, pseudotime = "pseudotime", lineages.1 = "4", lineages.2 = "7", parent.of.lineages = c("9","10","11"), opposite.parent = c("2"), min.visit = 1)
+pref.colors <- c("#CECECE", "#CBDAC2", RColorBrewer::brewer.pal(9, "YlGnBu")[3:9])
+
+gene <- "Neurog2"
+p1 <- plotBranchpoint(urd.tree, branchpoint.layout = layout1, label = gene, label.2 = NULL,
+                      label.type = "search", populations = c("PT", "cTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      title = gene, axis.lines = F, legend = T, fade.low = 0.5)
+
+gene <- "Gbx2"
+p2 <- plotBranchpoint(urd.tree, branchpoint.layout = layout1, label = gene, label.2 = NULL,
+                      label.type = "search", populations = c("PT", "cTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      title = gene, axis.lines = F, legend = T, fade.low = 0.5)
+gene <- "Lmo3"
+p3 <- plotBranchpoint(urd.tree, branchpoint.layout = layout1, label = gene, label.2 = NULL,
+                      label.type = "search", populations = c("PT", "cTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      title = gene, axis.lines = F, legend = T, fade.low = 0.5)
+
+gene <- "Tcf7l1"
+p4 <- plotBranchpoint(urd.tree, branchpoint.layout = layout1, label = gene, label.2 = NULL,
+                      label.type = "search", populations = c("PT", "cTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      title = gene, axis.lines = F, legend = T, fade.low = 0.5)
+
+gene <- "Barhl2"
+p5 <- plotBranchpoint(urd.tree, branchpoint.layout = layout1, label = gene, label.2 = NULL,
+                      label.type = "search", populations = c("PT", "cTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      title = gene, axis.lines = F, legend = T, fade.low = 0.5)
+
+pdf("./figures/Branchpoint1a.pdf", w =16, h = 5)
+plot_grid(p1,p2,p3,ncol = 3)
+dev.off()
+```
+
+# Preference plot at the branchpoint between rostral thalamus and prethalamus
+
+```{r fig.asp=2.5}
+layout2 <- branchpointPreferenceLayout(urd.tree, pseudotime = "pseudotime", lineages.1 = "6", lineages.2 = "3", parent.of.lineages = c("12"), opposite.parent = c("11"), min.visit = 1)
+pref.colors <- c("#CECECE", "#CBDAC2", RColorBrewer::brewer.pal(9, "YlGnBu")[3:9])
+
+pdf("./figures/Branchpoint_GABA1.pdf", w =9, h =12)
+gridExtra::grid.arrange(grobs=list(
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Hes1", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Ascl1", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Helt", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Gad1", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Dlx2", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Arx", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+    plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Dlx5", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Tal2", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Gata2", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Tal1", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Gata3", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5),
+  plotBranchpoint(urd.tree, branchpoint.layout = layout2, label = "Npy", label.2 = NULL,
+                      label.type = "search", populations = c("rTh", "PTh"),  visited.size = T,
+                      point.alpha = 0.2, pt.lim = NULL, color.scale = NULL,
+                      discrete.colors = NULL, ylab = "Pseudotime", xlab = "Preference",
+                      axis.lines = F, legend = T, fade.low = 0.5)
+), ncol=3)
+dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```
+

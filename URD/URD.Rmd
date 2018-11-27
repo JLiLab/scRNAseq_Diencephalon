@@ -1,0 +1,130 @@
+---
+title: "Infer trajectories of E12.5 diencephaloic cells"
+output: html_notebook
+toc: true
+---
+
+Load packages
+```{r options, echo=FALSE, results="hide",mesasge=FALSE, error=FALSE, include=FALSE, autodep=TRUE}
+library(URD);library(Seurat);
+
+# create folders to organize output
+dir.create("figures");dir.create("tables");dir.create("data")
+```
+
+# Load Seurat object and export it to URD
+```{r}
+cdS <- readRDS("../Seurat/data/Seurat_allCells.rds")
+
+# Remove the low-quiality cell cluster (#11)
+cdSsub <- SubsetData(cdS, ident.remove = 11, subset.raw =T)
+
+# Import URD from Seurat
+urd <- seuratToURD(cdSsub)
+urd@meta$Seurat <- as.factor(urd@meta$tree.ident)
+
+# Delete the original data
+rm(list=c("cdS", "cdSsub"))
+
+# Perform garbage collection to free RAM.
+shhhh <- gc()
+
+```
+
+# Find variable genes
+```{r}
+urd <- findVariableGenes(urd, cells.fit = NULL, set.object.var.genes = T,
+                         diffCV.cutoff = 0.5, mean.min = 0.005, mean.max = 100, main.use = "",
+                         do.plot = T)
+```
+
+# Perform PCA and calculate a tSNE projection
+```{r}
+urd <- calcPCA(urd, genes.use = urd@var.genes, pcs.store = NULL,
+               store.thresh = 2, mp.factor = 1, do.print = T, verbose = T)
+pcSDPlot(urd)
+
+set.seed(18)
+urd <- calcTsne(urd, dim.use = "pca",
+                which.dims = which(urd@pca.sig), perplexity = 30, theta = 0.5,
+                max_iter = 1000, verbose = FALSE)
+
+set.seed(17)
+urd <- graphClustering(urd, num.nn=c(30,40,50), do.jaccard = TRUE, method = "Louvain")
+set.seed(17)
+urd <- graphClustering(urd, dim.use="pca", num.nn=c(30,40,50,60,65,70,75), do.jaccard=T, method="Infomap")
+```
+
+# Inspect cell clustering
+```{r fig.asp = 1}
+gridExtra::grid.arrange(grobs=list(
+  plotDim(urd, "Seurat", legend=F, plot.title="Seurat clustering id", alpha=1, label.clusters = T),
+  plotDim(urd, "Louvain-30", legend=F, plot.title="Louvain-Jaccard Graph-based Clustering (30 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Louvain-40", legend=F, plot.title="Louvain-Jaccard Graph-based Clustering (40 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Infomap-40", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (40 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Louvain-50", legend=F, plot.title="Louvain-Jaccard Graph-based Clustering (50 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Infomap-60", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (60 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Infomap-65", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (65 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Infomap-70", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (70 NNs)", alpha=1, label.clusters = T),
+  plotDim(urd, "Infomap-75", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (75 NNs)", alpha=1, label.clusters = T)
+), ncol=3)
+```
+
+# Inspect marker expression on tSNE plots
+```{r fig.asp = 1.66}
+gridExtra::grid.arrange(grobs=list(
+  plotDim(urd, "Infomap-65", legend=F, plot.title="Infomap-Jaccard Graph-based Clustering (65 NNs)", alpha=1, 
+          label.clusters = T),
+  plotDim(urd, "Gata3", legend=F, plot.title="Gata3 - rTh_neurons"),
+  plotDim(urd, "Dlx5", legend=F, plot.title="Dlx5 - PreTh"),
+  plotDim(urd, "Cd47", legend=F, plot.title="Cd47 - cTh_neurons"),
+  plotDim(urd, "Pitx2", legend=F, plot.title="Pitx2 - ZLI"),
+  plotDim(urd, "Tac1", legend=F, plot.title="Tac1 - cTh_neurons"),
+  plotDim(urd, "Tal2", legend=F, plot.title="Tal2 - rTh precursors"),
+  plotDim(urd, "Lhx2", legend=F, plot.title="Lhx2 - cTh_precursors"),
+  plotDim(urd, "Neurod1", legend=F, plot.title="Neurod1 - ET precursors"),
+  plotDim(urd, "Fgfbp3", legend=F, plot.title="Fgfbp3 - roofplate"),
+  plotDim(urd, "Ezr", legend=F, plot.title="Ezr - unknown"),
+  plotDim(urd, "Ebf1", legend=F, plot.title="Ebf1 - pretecutm"),
+  plotDim(urd, "Hes5", legend=F, plot.title="Hes5 - NPC"),
+  plotDim(urd, "Vtn", legend=F, plot.title="Vtn - Endothelium"),
+  plotDim(urd, "Apoe", legend=F, plot.title="Apoe - microglia")
+), ncol=3)
+```
+
+# Remove outliers
+## Identify cells that are poorly connected
+```{r}
+# Calculate a k-nearest neighbor graph
+urd <- calcKNN(urd, genes.use = urd@var.genes, nn=100)
+
+# Plot cells according to their distance to their nearest and 20th nearest neighbors, and identify those with unusually large distances.
+outliers <- knnOutliers(urd, nn.1=1, nn.2=20, x.max=40, slope.r=1.1, int.r=2.9, slope.b=0.85, int.b=10, 
+                        title = "Identifying Outliers by k-NN Distance.")
+```
+
+## Remove non-neural (endothelium and microglia)
+```{r fig.width=2, fig.height=2}
+plotDim(urd, "Infomap-65", legend=F, alpha=1, label.clusters = T)
+
+# remove non-neural (endothelium and microglia)
+nonNeural.cell.id <- c("39","42")
+nonNeural.cells <- cellsInCluster(urd, "Infomap-65", nonNeural.cell.id)
+length(outliers);length(nonNeural.cells)
+```
+
+## Subset object to eliminate outliers
+```{r}
+cells.keep <- setdiff(colnames(urd@logupx.data), c(outliers,nonNeural.cells))
+length(cells.keep)
+
+urd.trimmed <- urdSubset(urd, cells.keep=cells.keep)
+saveRDS(urd.trimmed, file="./data/object_2_trimmed.rds")
+```
+
+# Print session information
+```{r}
+date()
+sessionInfo()
+```
+

@@ -1,0 +1,132 @@
+---
+title: "Examination of spatial expression trends of roof plate and p2 progenitor cells using trendsceek"
+linestretch: 0.5
+output:
+ html_notebook: default
+ pdf_document:
+   latex_engine: xelatex
+---
+\fontsize{8}{18}
+
+# Load packages
+```{r load-packages, message=F, warning=F}
+library(Seurat);library(trendsceek)
+```
+
+# load Seurat object of all cells and subset only the roof plate cells and p2 progenitor cells
+```{r}
+cdS <- readRDS("./data/Seurat_allCells.rds")
+cdSsub <- SubsetData(cdS, ident.use = c(13,15), subset.raw = T)
+```
+
+# Inspect region-specific gene expression in the diencephalic roof plate
+```{r}
+FeaturePlot(cdSsub, c("Wnt1","Pax3"),overlay = T, cols.use = c("azure2", "red", "blue","green"), no.axes = T) 
+FeaturePlot(cdSsub, c("Fgf8","Rspo3"),overlay = T, cols.use = c("azure2", "red", "blue","green"), no.axes = T)
+```
+
+```{r}
+cdSsub <- FindVariableGenes(cdSsub)
+```
+
+```{r}
+cdSsub <- RunPCA(cdSsub, pc.genes = cdSsub@var.genes, pcs.compute = 30, pcs.print = 5, genes.print = 5)
+PCHeatmap(cdSsub, pc.use = 1:9, cells.use = 500, do.balanced = TRUE, label.columns = FALSE, use.full = FALSE)
+
+# Repeat with top PCA gene
+PCAgenes <- PCTopGenes(cdSsub, pc.use = c(1,5,6,7), num.genes = 20, use.full = FALSE,do.balanced = FALSE)
+
+cdSsub <- RunPCA(cdSsub, pc.genes = PCAgenes, pcs.compute = 30, pcs.print = 5, genes.print = 5)
+PCHeatmap(cdSsub, pc.use = 1:9, cells.use = 500, do.balanced = TRUE, label.columns = FALSE, use.full = FALSE)
+```
+
+# Run t-SNE
+```{r}
+cdSsub <- RunTSNE(cdSsub, cells.use = NULL, dims.use = c(1:4), k.seed = 1,
+                  do.fast = F, add.iter = 0, genes.use = NULL,
+                  reduction.use = "pca", dim_embed = 2, perplexity = 50)
+```
+
+```{r}
+TSNEPlot(cdSsub,do.label = T)
+# saveRDS(cdSsub, file = "./data/Seurat_p2.rds")
+```
+
+# Export t-SNE and normalized expression to trendsceek
+## normalized counts
+```{r}
+counts_norm <- as.matrix(cdSsub@data)
+# Use variable genes calculated by Seurat minus those involved in the cell cycle
+cc <- read.csv("/Volumes/jali/Genome/Cell\ Cycle\ Genes.csv", stringsAsFactors = F)
+cc.genes <- cc$mGene
+var.genes <- setdiff(cdSsub@var.genes,cc.genes)
+length(var.genes)
+
+counts_sub = counts_norm[var.genes, ]
+dim(counts_sub)
+```
+
+# Create point-pattern using tSNE positions as spatial distribution and expression levels as mark distribution
+##Convert tSNE cell positions to point pattern
+```{r}
+pp = pos2pp(cdSsub@dr$tsne@cell.embeddings)
+```
+
+##Set marks as the logged normalized gene expression 
+```{r}
+pp = set_marks(pp, counts_sub, log.fcn = log10)
+```
+
+# Run trendsceek
+```{r}
+pp2plot = pp_select(pp, var.genes)
+
+## Save the object and run in the cluster
+# saveRDS(pp2plot, file = "./data/pp2plot.rds")
+# trendstat_list = trendsceek_test(pp2plot, nrand = 10000, ncores = 24)
+# saveRDS(trendstat_list, "./data/trendstat_list.rds")
+
+# Load the saved object
+trendstat_list <- readRDS(file="./data/trendstat_list.rds")
+head(trendstat_list[['supstats_wide']])
+```
+
+# Extract significant genes
+```{r}
+sig_list = extract_sig_genes(trendstat_list, alpha = 0.01)
+
+# Number of significant genes
+lapply(sig_list, nrow)
+
+## Find all the genes identified by different methods
+sig_genes <- unique(c(sig_list$Emark$gene,sig_list$markcorr$gene,sig_list$markvario$gene,sig_list$Vmark$gene))
+length(sig_genes)
+
+for (gene in sig_genes){
+  pp_sig = pp_select(pp, gene)
+  png(paste0("./trendsceek/trendsceek_",gene,".png"), width = 960, h = 960)
+  plot_pp_scatter(pp_sig, log_marks = FALSE, scale_marks = TRUE, pal.direction = -1)
+  dev.off()
+}
+```
+
+# Plot the significant genes that we found ISH data from Allen Developing Mouse Brain Altas (Figure 4)
+```{r}
+pp = set_marks(pp, counts_norm, log.fcn = log10)
+
+# Plot top variable genes in tSNE space
+sig_genes <- c("Ttr","Fgf8","Bmp4","Pax3","Irx3","Olig3","Spry1","Fgfr3","Rspo1","Rspo2","Rspo3")
+
+for (gene in sig_genes){
+  pp_sig = pp_select(pp, gene)
+  png(paste0("./figures/trendsceek_",gene,".png"), width = 960, h = 960)
+  plot_pp_scatter(pp_sig, log_marks = FALSE, scale_marks = TRUE, pal.direction = -1)
+  dev.off()
+}
+```
+
+# Print session informaiotn
+```{r}
+sessionInfo()
+```
+
