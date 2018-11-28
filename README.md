@@ -15,6 +15,4 @@ This project is licensed under the MIT License.
 **Defining developmental diversification of diencephalon neurons through single-cell gene expression profiling**  
 Guo, Q. and Li, J. Y. H. (2018)
 
-
-biorxiv preprint
-[biorxiv preprint](https://www.biorxiv.org/content/early/)
+[biorxiv preprint](https://www.biorxiv.org/content/early/2018/11/28/481317)
